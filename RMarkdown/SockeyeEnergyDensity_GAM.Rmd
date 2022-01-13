@@ -1081,7 +1081,7 @@ write_csv(stockED_bestmodel1_fall_simp, here::here(OutputFolder, "/ED_fall_simp.
 
 ## Supplemental Information
 
-RMarkdown file (SockeyeEnergyDensity_GAM.Rmd) is available on Github for R code underlying the models, tables and figures. 
+An [RMarkdown file](https://github.com/ErikaDAnderson/SockeyeEnergyDensityPub/blob/main/RMarkdown/SockeyeEnergyDensity_GAM.Rmd) is available on Github for code underlying the models, tables and figures. 
 
 ```{r supplemental}
 

@@ -1,0 +1,1151 @@
+---
+title: "Energy Density in Juvenile Sockeye Salmon Stocks"
+author: "Erika Anderson, Terry Beacham, and Jackie King"
+date: "Compiled on `r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, warning=FALSE, results='hide', message=FALSE}
+
+# load libraries
+library(tidyverse) # data manipulation
+library(here) # save in relative locations
+library(lubridate) # dates
+library(rgdal) # shapefiles
+library(modelr) # modeling function spread_predictions
+library(mgcv) # gam models
+library(ggpubr) # panel of plots with ggarrange
+library(kableExtra) # nice tables
+library(car) # scatterplot matrix function
+library(gratia) # GAM diagnostics with draw and appraise
+library(viridis) # color scheme for color blind
+library(broom) # tidy modeling options and glance function
+library(patchwork) # plot arranging using plot_annotation
+
+# default whether code displayed in Rmarkdown
+knitr::opts_chunk$set(echo = TRUE)
+
+# center figures
+knitr::opts_chunk$set(fig.align = 'center')
+
+# default with kable tables to display NA as blank
+options(knitr.kable.NA = '')
+
+# set all ggplots same theme
+theme_set(theme_bw())
+
+# define date-specific Output folder
+OutputFolder <- str_c("Output/", Sys.Date())
+
+# create folder if not present
+dir.create(here::here(OutputFolder), showWarnings = FALSE)
+
+# no significant figures
+options(scipen = 9999999)
+
+# bigger font in figures
+biggerfontfn <- function(...) {
+  theme(strip.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 12))
+}
+
+```
+
+## Data
+
+```{r loadData}
+
+cruisesTable <- read_csv(here::here("Data/cruisesTable.csv"),
+                         col_types = cols(
+                           CRUISE = col_double(),
+                           START_DATE = col_date(format = ""),
+                           END_DATE = col_date(format = ""),
+                           VESSEL = col_character(),
+                           TOWS = col_double(),
+                           GSI = col_double(),
+                           ED = col_double()
+                         ))
+
+# cal_all: samples with calorimetry data
+cal_all <- read_csv(here::here("Data/cal_all.csv"),
+                    col_types = cols(
+                      CRUISE = col_character(),
+                      DATE = col_date(format = ""),
+                      FISH_NUMBER = col_character(),
+                      YEAR = col_double(),
+                      FORK = col_double(),
+                      WGT = col_double(),
+                      PDRY = col_double(),
+                      PERCENTWATER  = col_double(),
+                      KJPERGWET  = col_double(),
+                      ED = col_double(),
+                      SEASON  = col_factor(),
+                      ERA = col_factor(),
+                      LAT = col_double(),
+                      LONG = col_double(),
+                      YDAY1 = col_double(),
+                      JULIAN = col_double(),
+                      YDAY2 = col_double(),
+                      MONTH = col_factor(),
+                      CATCH = col_character()
+                    ))
+
+# cal_all_gsi: samples with calorimetry and gsi 
+# not all assigned to stock so smaller df than cal_all
+cal_all_gsi <- read_csv(here::here("Data/cal_all_gsi.csv"),
+                        col_types = cols(
+                          CRUISE = col_double(),
+                          DATE = col_date(format = ""),
+                          FISH_NUMBER = col_character(),
+                          FORK = col_double(),
+                          WGT = col_double(),
+                          LAT = col_double(),
+                          LONG = col_double(),
+                          YEAR = col_double(),
+                          SEASON = col_factor(),
+                          PDRY = col_double(),
+                          YDAY1 = col_double(),
+                          ED = col_double(),
+                          METHOD = col_character(),
+                          SPECIES = col_character(),
+                          STOCK_FINAL = col_character(),
+                          PROB_1 = col_double(),
+                          HS_REGION = col_character(),
+                          CU_ACRO = col_character(),
+                          SOURCE = col_character(),
+                          YDAY2 = col_double(),
+                          MONTH = col_double(),
+                          STOCK = col_character(),
+                          ORIGIN = col_character(),
+                          PERCENTWATER = col_double(),
+                          KJPERGWET = col_double(),
+                          ERA = col_character(),
+                          JULIAN = col_double(),
+                          CATCH = col_factor()
+                        ))
+
+# dry_gsi: samples with gsi assignments and dry weights
+dry_gsi <- read_csv(here::here("Data/dry_gsi.csv"),
+                    col_types = cols(
+                      CRUISE = col_double(),
+                      DATE = col_date(format = ""),
+                      FISH_NUMBER = col_character(),
+                      FORK = col_double(),
+                      WGT = col_double(),
+                      LAT = col_double(),
+                      LONG = col_double(),
+                      YEAR = col_double(),
+                      SEASON = col_factor(),
+                      PDRY = col_double(),
+                      YDAY1 = col_double(),
+                      ED = col_double(),
+                      METHOD = col_character(),
+                      SPECIES = col_character(),
+                      STOCK_FINAL = col_character(),
+                      PROB_1 = col_double(),
+                      HS_REGION = col_character(),
+                      CU_ACRO = col_character(),
+                      SOURCE = col_character(),
+                      YDAY2 = col_double(),
+                      MONTH = col_double(),
+                      STOCK = col_character(),
+                      ORIGIN = col_character(),
+                      CATCH = col_factor()
+                    ))
+```
+
+## Model Development
+
+Use gamma distribution for strictly, positive real values. Log link function recommended for for gamma distribution. Use te() for interaction terms and ti() to decompose interactions. Thin plate regression = ts, and bs = "ts" is the default. Restricted maximum likelihood (Method = "REML") for fit. k = 10 is default. Knots be must checked with gam.check and increase as needed. Use concurvity function to check for colinearity of terms. 
+
+```{r models}
+
+# make function for GAMs
+gam_fn <- function(thisformula, thisdata) 
+{gam(thisformula, family = Gamma(link = "log"), method = "REML", data = thisdata)}
+
+# make function for rounded concurvity (type of colinearity)
+# only need for models with > 1 variable 
+# ranges between 0-1 where 1 is bad, 0 is good
+concurvity_fn <- function(model) {
+  round(concurvity(model),2)
+}
+
+# potential models 
+# rep gives confidence band on first plot
+gam_pdry <- gam_fn(ED ~ s(PDRY), cal_all)
+gam.check(gam_pdry, rep = 500)
+
+gam_pdry_fl <- gam_fn(ED ~ s(PDRY) + s(FORK), cal_all)  
+gam.check(gam_pdry_fl, rep = 500)
+concurvity_fn(gam_pdry_fl)
+
+gam_season <- gam_fn(ED ~ SEASON, cal_all)
+gam.check(gam_season)
+
+gam_fl <- gam_fn(ED ~ s(FORK), cal_all)  
+gam.check(gam_fl, rep = 500) # 0.94
+
+gam_month <- gam_fn(ED ~ MONTH, cal_all)  
+gam.check(gam_month, rep = 500)
+
+gam_catch <- gam_fn(ED ~ CATCH, cal_all)  
+gam.check(gam_catch, rep = 500)
+
+gam_catch_month <- gam_fn(ED ~ CATCH + MONTH, cal_all) 
+gam.check(gam_catch_month, rep = 500)
+
+gam_wgt <- gam_fn(ED ~ s(WGT), cal_all) 
+gam.check(gam_wgt, rep = 500)
+
+
+# models with GSI training data only 
+# reduced data set
+gam_stk <- gam_fn(ED ~ STOCK, cal_all_gsi)
+gam.check(gam_stk, rep = 500)
+
+##################################################
+# rejected models (high concurvity)
+##################################################
+#gam_pdry_wgt <- gam_fn(ED ~ s(PDRY) + s(WGT), cal_all)  
+#gam.check(gam_pdry_wgt, rep = 500)
+#concurvity_fn(gam_pdry_wgt) 
+#
+#gam_fl_wgt_interact <- gam_fn(ED ~ te(FORK, WGT), cal_all)
+#gam.check(gam_fl_wgt_interact, rep = 500) 
+#concurvity_fn(gam_fl_wgt_interact)
+#
+# gam_season_fl <- gam_fn(ED ~ SEASON + s(FORK), cal_all)
+# gam.check(gam_season_fl, rep = 500)
+# concurvity_fn(gam_season_fl) # concurvity
+
+# gam_season_wgt <- gam_fn(ED ~ SEASON + s(WGT), cal_all)
+# gam.check(gam_season_wgt, rep = 500)
+# concurvity_fn(gam_season_wgt) # concurvity
+
+# gam_pdry_season <- gam_fn(ED ~ s(PDRY) + SEASON, cal_all)
+# gam.check(gam_pdry_season, rep = 500) 
+# concurvity_fn(gam_pdry_season) #concurvity with season
+
+# gam_pdry_season_interact <- gam_fn(ED ~ SEASON + s(PDRY, by = SEASON), cal_all)
+# gam.check(gam_pdry_season_interact, rep = 500)
+# concurvity_fn(gam_pdry_season_interact) # concurvity
+
+# gam_pdry_fl_lat <- gam_fn(ED ~ s(PDRY) + s(FORK) + LAT, cal_all)
+# gam.check(gam_pdry_fl_lat, rep = 500) # OK
+# concurvity_fn(gam_pdry_fl_lat) # 0.29-1 concurvity issues with latitude
+
+# gam_pdry_fl_interact <- gam_fn(ED ~ te(PDRY, FORK), cal_all)
+# gam.check(gam_pdry_fl_interact, rep = 500) # 0.34
+# concurvity_fn(gam_pdry_fl_interact)
+# concurvity(gam_pdry_fl_interact, full = FALSE)# 0 look further
+
+# # decompose interaction
+# gam_pdry_fl_interact2 <- gam_fn(ED ~ ti(PDRY) + ti(FORK) + ti(PDRY, FORK),  cal_all)
+# gam.check(gam_pdry_fl_interact2, rep = 500) # 0.41-0.98
+# summary(gam_pdry_fl_interact2) # significance of interaction term
+# concurvity(gam_pdry_fl_interact2, full = TRUE) # concurvity
+# 
+# # check if models with and without interaction are different from each other
+# anova.gam(gam_pdry_fl, gam_pdry_fl_interact) # not diff
+
+# gam_pdry_fl_interact_lat <- gam_fn(ED ~ te(PDRY, FORK, k = c(12, 12)) + LAT, cal_all)
+# gam.check(gam_pdry_fl_interact_lat, rep = 500) # 0.82
+# concurvity_fn(gam_pdry_fl_interact_lat) # concurvity with latitude
+
+# gam_pdry_month <- gam_fn(ED ~ MONTH + s(PDRY), cal_all)
+# gam.check(gam_pdry_month, rep = 500) 
+# concurvity_fn(gam_pdry_month) # concurvity with month
+
+# gam_pdry_month_interact <- gam_fn(ED ~ MONTH + s(PDRY, by = MONTH), cal_all)
+# gam.check(gam_pdry_month_interact, rep = 500) # 0.49
+# concurvity_fn(gam_pdry_month_interact) # concurvity with month
+
+# # a different way to penalize model for differences by factor
+# #https://stats.stackexchange.com/questions/403772/different-ways-of-modelling-interactions-between-continuous-and-categorical-pred
+# gam_pdry2_month_interact <- gam_fn(ED ~ MONTH + s(PDRY) + s(PDRY, by = MONTH), cal_all)
+# gam.check(gam_pdry2_month_interact)
+# concurvity_fn(gam_pdry2_month_interact) # concurvity with month and pdry
+# summary(gam_pdry2_month_interact)
+# AIC(gam_pdry2_month_interact)
+
+# gam_pdry3_month_interact <- gam_fn(ED ~ MONTH + s(PDRY) + s(PDRY, by = MONTH, m= 1), cal_all)
+# gam.check(gam_pdry3_month_interact)
+# concurvity_fn(gam_pdry3_month_interact) # concurvity
+# summary(gam_pdry3_month_interact)
+# AIC(gam_pdry3_month_interact)
+
+# gam_fl_month <- gam_fn(ED ~ MONTH + s(FORK), cal_all)
+# gam.check(gam_fl_month) 
+# concurvity_fn(gam_fl_month) # concurvity with month
+
+# gam_fl_month_interact <- gam_fn(ED ~ MONTH + s(FORK, by = MONTH), cal_all)
+# gam.check(gam_fl_month_interact)
+# concurvity_fn(gam_fl_month_interact) # concurvity with month
+
+# gam_pdry_fl_month_interact <- gam_fn(ED ~ MONTH + te(PDRY, FORK, by = MONTH, k = 12), cal_all)
+# gam.check(gam_pdry_fl_month_interact) # adjusted k up to 12
+# concurvity_fn(gam_pdry_fl_month_interact) # concurvity in month
+# # note that this is different from t2(PDRY, FORK, by = MONTH)
+# # and different from s(PDRY, by = MONTH) + s(FORK, by = MONTH)
+
+## latitude in models
+# gam_lat_month <- gam_fn(ED ~ MONTH + s(LAT, k= 55), cal_all)
+# gam.check(gam_lat_month) # need > k but data doesn't support more
+# concurvity_fn(gam_lat_month) # issues with month
+
+# gam_lat_month_interact <- gam_fn(ED ~ MONTH + s(LAT, by = MONTH, k = 50), cal_all)
+# gam.check(gam_lat_month_interact) # need > k but data doesn't support it
+# concurvity_fn(gam_lat_month_interact) # concurvity with month
+
+# gam_pdry_fl_interact_month <- gam_fn(ED ~ MONTH + te(PDRY, FORK, k = c(5, 5)), cal_all)
+# gam.check(gam_pdry_fl_interact_month) 
+# concurvity_fn(gam_pdry_fl_interact_month) # concurvity with month
+
+# gam_pdry_catch_interact <- gam_fn(ED ~ CATCH + s(PDRY, by = CATCH), cal_all)
+# gam.check(gam_pdry_catch_interact, rep = 500)
+# concurvity_fn(gam_pdry_catch_interact) # concurvity with catch region
+
+# gam_pdry_fl_catch_interact <- gam_fn(ED ~ CATCH + te(PDRY, FORK, by = CATCH), cal_all)
+# gam.check(gam_pdry_fl_catch_interact, rep = 500)
+# concurvity_fn(gam_pdry_fl_catch_interact) # concurvity with catch
+
+# gam_pdry_catch_month_interact <- gam_fn(ED ~ CATCH + MONTH + s(PDRY, by = CATCH) + s(PDRY, by = MONTH), cal_all)
+# gam.check(gam_pdry_catch_month_interact) # 0.96-0.96
+# concurvity_fn(gam_pdry_catch_month_interact) # concurvity
+
+# gam_fl_catch <- gam_fn(ED ~ CATCH + s(FORK), cal_all)
+# gam.check(gam_fl_catch)
+# concurvity_fn(gam_fl_catch) # concurvity
+
+# gam_fl_catch_interact <- gam_fn(ED ~ CATCH + s(FORK, by = CATCH), cal_all)
+# gam.check(gam_fl_catch_interact) # 0.90-0.93
+# concurvity_fn(gam_fl_catch_interact) # concurvity
+
+# gam_fl_catch_month_interact <- gam_fn(ED ~ CATCH + MONTH + s(FORK, by = CATCH) + s(FORK, by = MONTH), cal_all)
+# gam.check(gam_fl_catch_month_interact) 
+# concurvity_fn(gam_fl_catch_month_interact) # concurvity
+
+# gam_pdry_wgt_interact <- gam_fn(ED ~ te(PDRY, WGT, k = c(11, 11)), cal_all)
+# gam.check(gam_pdry_wgt_interact, rep = 500)
+# concurvity_fn(gam_pdry_wgt_interact) # concurvity when increase knots
+
+# # decompose for colinearity and interaction
+# gam_pdry_wgt_interact2 <- gam_fn(ED ~ s(PDRY) + s(WGT) + ti(PDRY, WGT, k = c(11, 11)), cal_all)
+# gam.check(gam_pdry_wgt_interact2, rep = 500)
+# concurvity_fn(gam_pdry_wgt_interact2) # concurvity
+
+# # check if models with and without interaction are different from each other
+# anova.gam(gam_pdry_wgt, gam_pdry_wgt_interact) # not diff
+
+# gam_pdry_wgt_catch_interact <- gam_fn(ED ~ CATCH + te(PDRY, WGT, by = CATCH), cal_all)
+# gam.check(gam_pdry_wgt_catch_interact)
+# concurvity_fn(gam_pdry_wgt_catch_interact) #concurvity
+
+# gam_wgt_fl_catch_interact <- gam_fn(ED ~ CATCH + te(WGT, FORK, by = CATCH), cal_all)
+# gam.check(gam_wgt_fl_catch_interact)
+# concurvity_fn(gam_wgt_fl_catch_interact) # concurvity
+
+# gam_pdry_wgt_month_interact <- gam_fn(ED ~ MONTH + te(PDRY, WGT, by = MONTH, k = c(15, 15)), cal_all)
+# gam.check(gam_pdry_wgt_month_interact, rep = 500)
+# concurvity_fn(gam_pdry_wgt_month_interact) # concurvity
+
+# gam_wgt_month_interact <- gam_fn(ED ~ MONTH + s(WGT, by = MONTH), cal_all)
+# gam.check(gam_wgt_month_interact, rep = 500)
+# concurvity_fn(gam_wgt_month_interact) # concurvity
+
+# gam_wgt_catch_interact <- gam_fn(ED ~ CATCH + s(WGT, by = CATCH), cal_all)
+# gam.check(gam_wgt_catch_interact, rep = 500)
+# concurvity_fn(gam_wgt_catch_interact) # concurvity
+
+# gam_wgt_month_interact <- gam_fn(ED ~ MONTH + s(WGT, by = MONTH), cal_all)
+# gam.check(gam_wgt_month_interact, rep = 500)
+# concurvity_fn(gam_wgt_month_interact) # concurvity
+
+# gam_fl_wgt <- gam_fn(ED ~ s(FORK) + s(WGT), cal_all)
+# gam.check(gam_fl_wgt, rep = 500)
+# concurvity_fn(gam_fl_wgt) # concurvity
+
+# gam_stk_yd <- gam_fn(ED ~ STOCK + s(YDAY2), cal_all_gsi)
+# gam.check(gam_stk_yd)
+# concurvity_fn(gam_stk_yd) # concurvity
+
+# gam_stk_pdry <- gam_fn(ED ~ s(PDRY) + STOCK,  cal_all_gsi)
+# gam.check(gam_stk_pdry)
+# concurvity_fn(gam_stk_pdry) # concurvity
+
+##################################################
+
+# make list of potential models to evaluate
+modelList <- list(gam_catch = gam_catch,
+                  gam_catch_month = gam_catch_month,
+                  gam_fl = gam_fl,
+                  gam_month = gam_month,
+                  gam_pdry = gam_pdry,
+                  gam_pdry_fl = gam_pdry_fl,
+                  gam_season = gam_season,
+                  gam_stk = gam_stk,
+                  gam_wgt = gam_wgt)
+
+# use data frame with list columns to hold all models together
+modelDf_orig <- tibble(thismodel = modelList)
+
+# create function to get model formula from model in list column
+getFormula_fn <- function(x) {
+  deparse(x$formula)
+}
+
+# model to get deviance explained from all models
+getDevianceExplained_fn <- function(x) {
+  summary(x)$dev.expl
+}
+
+# add AIC to compare models
+modelDf <- modelDf_orig %>%
+  mutate(thisname = names(thismodel),
+         thisAIC = round(map_dbl(thismodel, AIC), 2),
+         thisdeviance = round(map_dbl(thismodel, getDevianceExplained_fn)*100,2),
+         updateName = str_replace_all(thisname, "gam_", ""),
+         thisformula = map_chr(thismodel, getFormula_fn)) %>%
+  arrange(-thisdeviance) %>%
+  dplyr::select(updateName,thisformula, thisAIC, thisdeviance) 
+
+# save as csv info for table 2
+write_csv(modelDf, here::here(OutputFolder, "/modelTable.csv"), na = "")
+
+# explore model results
+BestModels <- list(gam_pdry_fl,
+                   gam_wgt)
+
+# look at model summaries
+map(BestModels, summary)
+
+# define models to use
+bestmodel1 <- gam_pdry_fl
+bestmodel2 <- gam_wgt
+
+# variables for model names in text
+bestmodel1name <- "pdry_fl"
+bestmodel2name <- "wgt"
+
+# save models
+saveRDS(bestmodel1, here::here(str_c(OutputFolder,
+                                     "/bestmodel1.rds")))
+saveRDS(bestmodel2, here::here(str_c(OutputFolder,
+                                      "/bestmodel2.rds")))
+saveRDS(gam_stk,  here::here(str_c(OutputFolder,
+                                   "/gam_stk.rds")))
+
+write_csv(modelDf, here::here(str_c(OutputFolder,
+                                    "/modelDf.csv")))
+
+###################################################
+
+# get vector of stocks that can use stock model
+cal_stocks_vec <- cal_all_gsi %>%
+  select(STOCK) %>%
+  distinct() %>%
+  pull(STOCK)
+
+# estimate ED with top models, including stock
+dry_gsi_mod <- dry_gsi %>%
+  filter(STOCK %in% cal_stocks_vec) %>%
+  spread_predictions(gam_stk, type = "response") %>%
+  right_join(., dry_gsi, by = c("CRUISE", "DATE", "FISH_NUMBER", "FORK", "WGT", "LAT", "LONG", "YEAR", "SEASON", "PDRY", "YDAY1", "ED", "METHOD", "SPECIES", "STOCK_FINAL", "PROB_1", "HS_REGION", "CU_ACRO", "SOURCE", "YDAY2", "MONTH", "STOCK", "ORIGIN", "CATCH")) %>%
+  spread_predictions(bestmodel1,
+                     bestmodel2,
+                     type = "response") %>%
+  mutate(ED_1 = if_else(is.na(ED), bestmodel1, ED),
+         ED_2 = if_else(is.na(ED), bestmodel2, ED),
+         ED_stk = if_else(is.na(ED), gam_stk, ED))
+
+```
+
+## Tables
+
+### Models
+
+Table 1. Generalized additive models for juvenile sockeye salmon energy density, Akaike information criterion (AIC), ordered by decreasing percent deviance explained. All models used a gamma distribution with a log link function, the restricted maximum likelihood (REML) method, and basis functions were checked. Abbreviations: ED = energy density, PDRY = percent dry weight, FORK = fork length, WGT = wet weight, CATCH = catch region, MONTH = month caught. 
+
+```{r modelTable}
+
+# display model table
+kable(modelDf,
+      col.names = c("Name", "Model", "AIC", "Deviance Explained")) %>%
+  kable_styling()
+
+```
+
+### Origins
+
+```{r origin}
+
+# number of stocks in training dataset
+stocksintraining <- length(unique(cal_all_gsi$STOCK)) 
+stocksintraining
+
+# number of stocks in full dataset
+stockinlargedataset <- length(unique(dry_gsi$STOCK)) 
+stockinlargedataset
+
+# number of modeled results in full data
+ndry_gsi_mod <- nrow(dry_gsi_mod)
+ndry_gsi_mod
+
+# group stocks by high sea region
+reg_full <- dry_gsi_mod %>%
+  mutate(HS_REGION = str_replace_all(HS_REGION, "RIVERS & SMITH INLET", "BC CENTRAL COAST")) %>%
+  group_by(HS_REGION) %>%
+  summarise(nFull = length(FISH_NUMBER),
+            perFull = round(nFull/ndry_gsi_mod * 100, 0),
+            .groups = "drop") %>%
+  arrange(-perFull)
+
+# do same for training data set to compare
+ncal_all_gsi <- nrow(cal_all_gsi)
+
+reg_train <- cal_all_gsi %>%
+  mutate(HS_REGION = str_replace_all(HS_REGION, "RIVERS & SMITH INLET", "BC CENTRAL COAST")) %>%
+  group_by(HS_REGION) %>%
+  summarise(nTrain = length(FISH_NUMBER),
+            perTrain = round(nTrain/ncal_all_gsi * 100, 0),
+            .groups = "drop") %>%
+  arrange(-perTrain)
+
+# put together
+reg <- reg_train %>%
+  right_join(., reg_full, by = "HS_REGION") %>%
+  mutate(perTrainFull = round(nTrain/nFull * 100, 0),
+         HS_REGION = str_to_title(HS_REGION),
+         HS_REGION = gsub("Bc", "BC", HS_REGION),
+         HS_REGION = gsub("Wcvi", "WCVI", HS_REGION),
+         HS_REGION = gsub("Ecvi", "ECVI", HS_REGION),
+         HS_REGION = gsub("Seak", "SEAK", HS_REGION)) %>%
+  select(-perTrainFull) %>%
+  replace_na(list(nTrain = 0, perTrain = 0))
+
+# variables for text
+fraserperTrain <- reg %>% 
+  filter(HS_REGION == "Fraser") %>%
+  pull(perTrain)
+fraserperTrain
+
+fraserperFull <- reg %>% 
+  filter(HS_REGION == "Fraser") %>%
+  pull(perFull)
+fraserperFull
+
+# write as csv
+write_csv(reg, here::here(OutputFolder, "/regions.csv"), na = "-")
+
+```
+
+Table 2. Geographic origin of juvenile sockeye salmon with known genetic stock assignments within the training and full data listed from most abundant to least abundant in the training data. The majority of juvenile sockeye salmon originated in the Fraser River System (Fraser). Moderate samples were collected from BC North Coast, West Coast Vancouver Island (WCVI), and BC Central Coast stocks (including Rivers and Smith Inlets). Limited samples were collected from East Coast Vancouver Island (ECVI), Puget Sound, Columbia River System (Columbia), BC South Coast stocks, and South East Alaska (SEAK). 
+
+```{r originTable}
+
+# display region table
+kable(reg,
+      col.names = c("Region of Origin", "n training", "% training", "n full", "% full")) %>%
+  kable_styling()
+
+```
+
+### Comparison
+
+```{r comparison}
+
+# function for standard error of the mean
+sem_fn <- function(x) {
+
+  sd(x, na.rm = TRUE)/sqrt(length(x[!is.na(x)]))
+}
+
+# function to get totals for best model
+EDbyStockfn <- function(df, season) {
+  
+  if (season == "all") {df2 <- df}
+  if (season == "summer") {df2 <- df %>% filter(MONTH %in% c(6,7,8))}
+  if (season == "fall") {df2 <- df %>% filter(MONTH %in% c(9,10,11))}
+
+df2  %>%
+  mutate(HS_REGION = str_to_title(HS_REGION),
+         HS_REGION = str_replace_all(HS_REGION, "Bc", "BC"),
+         HS_REGION = str_replace_all(HS_REGION, "Wcvi", "WCVI"),
+         HS_REGION = str_replace_all(HS_REGION, "Ecvi", "ECVI"),
+         HS_REGION = str_replace_all(HS_REGION, "Seak", "SEAK")) %>%
+  dplyr::rename(Stock = STOCK) %>%
+group_by(Stock, ORIGIN, HS_REGION) %>%
+  summarise( n = length(FISH_NUMBER),
+             mean = round(mean(ED_1 , na.rm = TRUE), 2),
+             min = round(min(ED_1 , na.rm = TRUE),2),
+             max = round(max(ED_1 , na.rm = TRUE),2),
+             se = round(sem_fn(ED_1), 2),
+             sd = round(sd(ED_1), 2),
+             .groups = "drop") %>%
+  arrange(-mean)
+
+  }
+
+stockED_bestmodel1 <- EDbyStockfn(dry_gsi_mod, "all")
+stockED_bestmodel1_summer <- EDbyStockfn(dry_gsi_mod, "summer")
+stockED_bestmodel1_fall <- EDbyStockfn(dry_gsi_mod, "fall")
+
+# get totals for stock model
+stockED_stk  <- dry_gsi_mod  %>%
+  mutate(HS_REGION = str_to_title(HS_REGION),
+         HS_REGION = str_replace_all(HS_REGION, "Bc", "BC"),
+         HS_REGION = str_replace_all(HS_REGION, "Wcvi", "WCVI"),
+         HS_REGION = str_replace_all(HS_REGION, "Ecvi", "ECVI"),
+         HS_REGION = str_replace_all(HS_REGION, "Seak", "SEAK")) %>%
+  dplyr::rename(Stock = STOCK) %>%
+  filter(!(is.na(ED_stk))) %>%
+  group_by(Stock, ORIGIN, HS_REGION) %>%
+  summarise( n = length(FISH_NUMBER),
+             mean = round(mean(ED_stk, na.rm = TRUE), 2),
+             min = round(min(ED_stk , na.rm = TRUE),2),
+             max = round(max(ED_stk , na.rm = TRUE),2),
+             se = round(sem_fn(ED_stk), 2),
+             sd = round(sd(ED_stk), 2),
+             .groups = "drop") %>%
+  arrange(-mean)
+
+# create a function to total using different models
+# find totals, min and max, se and sd
+get_totals_fn <- function(model, colName, df) {
+
+  myenc <- enquo(colName)
+
+  if (model == "stock") {
+    df %>%
+      filter(!is.na(!!myenc)) %>%
+      summarise(model = model,
+                n = length(FISH_NUMBER),
+                mean = round(mean(!!myenc, na.rm = TRUE), 2),
+                min = round(min(!!myenc, na.rm = TRUE),2),
+                max = round(max(!!myenc, na.rm = TRUE),2),
+                se = round(sem_fn(!!myenc), 2),
+                sd = round(sd(!!myenc, na.rm = TRUE), 2))
+
+
+  } else {
+
+    df %>%
+      summarise(model = model,
+                n = length(FISH_NUMBER),
+                mean = round(mean(!!myenc, na.rm = TRUE), 2),
+                min = round(min(!!myenc, na.rm = TRUE),2),
+                max = round(max(!!myenc, na.rm = TRUE),2),
+                se = round(sem_fn(!!myenc), 2),
+                sd = round(sd(!!myenc, na.rm = TRUE), 2))
+  }
+}
+
+#apply to select models to compare
+Totals_measured <- get_totals_fn("measured", ED , cal_all)
+Totals_bestmodel1 <- get_totals_fn(bestmodel1name, bestmodel1, dry_gsi_mod)
+Totals_bestmodel2 <- get_totals_fn(bestmodel2name, bestmodel2 , dry_gsi_mod)
+Totals_stock <- get_totals_fn("stock", gam_stk, dry_gsi_mod)
+
+# put models together
+Total_ED <- rbind(Totals_measured, Totals_bestmodel1,
+                  Totals_bestmodel2, Totals_stock)
+
+# write as csv
+write_csv(Total_ED, here::here(OutputFolder, "/EDTotals.csv"),
+          na = "")
+```
+
+Comparison of the overall energy densities from measured and estimated juvenile sockeye salmon using three models defined in Table 2.
+
+```{r comparisonTable}
+
+# display table
+kable(Total_ED) %>%
+     kable_styling()
+
+```
+
+### Birkenhead
+
+A highly variable stock in summer was Birkenhead, within the Lillooet-Harrison L conservation unit. From 2002-2009, this stock was moved to the summer run timing group and in 2012 the status was accessed as green status. In 2010, Birkenhead was moved back into the late run timing group and by 2017 was accessed as amber status (Grant et al 2011, Fisheries and Oceans Canada 2020).  It is plausible that the variability with Birkenhead juvenile sockeye salmon represents the variability associated with shifting run timing and decreasing condition. Find pre-2010 energy densities to compare to after 2010.
+
+```{r birkenhead}
+
+birk <- dry_gsi_mod %>%
+  filter(STOCK == "Birkenhead") %>%
+  select(YEAR, ED_1) %>%
+  mutate(era = if_else(YEAR < 2010, "summer", "late")) %>%
+  group_by(era) %>%
+  summarise(n = n(),
+    meanED = mean(ED_1))
+birk
+
+```
+
+## Figures
+
+### Map
+
+```{r makeMap, message = FALSE}
+
+# load shapefile of coast
+shapefile <- readOGR(here::here("Input", "Spatial"), "Land", verbose = FALSE)
+
+# convert to a dataframe for use in ggplot2
+shapefile_df <- fortify(shapefile)
+
+# get map of north America
+nAmerica <- map_data("world") %>% 
+  filter(region %in% c("Canada", "USA"))
+
+# make map of North America with bounding box
+can <- ggplot() +
+  geom_map(data = nAmerica, map = nAmerica, aes(map_id = region),
+           color = "black", fill = "gray90", size = 0.2) +
+  coord_quickmap(xlim = c(-150, -55), ylim = c(30, 70)) +
+  # add bounding box showing location of BC map
+  geom_rect(aes(xmin = -137, xmax = -122, 
+                ymax = 48, ymin = 58.3), 
+            fill = NA, color = "black", size = 0.5) +
+  geom_text(aes(-105, 55), label = "Canada") +
+  geom_text(aes(-103, 40), label = "USA") +
+    labs(x = "Longitude",
+         y = "Latitude") +
+  theme(panel.grid = element_blank(),
+        strip.background = element_rect(fill = "white")) 
+
+# Display tow locations on map
+  bc <- ggplot(dry_gsi, aes(LONG, LAT)) +
+  geom_path(data = shapefile_df,
+            aes(long, lat, group = group),
+            color = "darkgrey", na.rm = TRUE) +
+  geom_point(shape = 16, size = 0.5) +
+  coord_quickmap(xlim = c(-137, -122), ylim = c(48, 58.3)) +
+    # hide BC - Alberta border
+  geom_rect(aes(xmin = -128, xmax = -120, 
+                ymax = 60, ymin = 55), 
+            fill = "white", color = "white", size = 0.5) +
+  theme(panel.grid = element_blank(),
+        strip.background = element_rect(fill = "white")) +
+  labs(x = "Longitude",
+       y = "Latitude")
+  
+  mapstogether <- ggpubr::ggarrange(can, bc, labels = "AUTO")
+
+# save as png
+ggsave(here::here(OutputFolder, "/map.png"),
+       plot = mapstogether,
+       width =  6, height = 3.5,
+       dpi = 600)
+
+```
+
+![](map.png)
+
+Figure 1. A. Sampling areas in British Columbia, Canada and southeast Alaska, USA. B. Tow locations (black circles) for juvenile sockeye salmon collected from 1998-2012 and 2018-2019 along coastline.
+
+
+### Boxplot
+
+```{r boxplot}
+
+#select most abundant stocks with energy density values
+abundantED <- dry_gsi_mod %>%
+  group_by(STOCK) %>%
+  count() %>%
+  ungroup() %>%
+  top_n(., 8, n) %>%
+  pull(STOCK)
+
+# create data frame to label the number of samples in faceted plot
+nAbundant <- dry_gsi_mod %>%
+  filter(STOCK %in% abundantED) %>%
+  group_by(STOCK) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(nlabel = str_c(STOCK, " (n=", n, ")", sep = ""))
+
+# select data and reorder for graph
+ED_compare_models <- dry_gsi_mod %>%
+  filter(STOCK %in% abundantED) %>%
+  pivot_longer(., cols = c(ED, bestmodel1, bestmodel2, 
+                           #gam_stk,
+                           )) %>%
+  dplyr::select(STOCK, name, value) %>%
+  left_join(., nAbundant, by = "STOCK") %>%
+  filter(!(is.na(value)))
+
+# order the model types for graph
+ED_compare_models$name <- as.factor(ED_compare_models$name)
+#unique(ED_compare_models$name)
+levels(ED_compare_models$name) <- c("ED", 
+                                    bestmodel1name,
+                                    bestmodel2name
+                                    #,
+                                    #"gam_stock"
+                                    )
+
+# graph the comparison
+ggplot(ED_compare_models) +
+  facet_wrap(~nlabel, ncol = 2) +
+  geom_boxplot(aes(name, value)) +
+  theme(axis.text.x = element_text(angle = 90),
+        strip.background = element_rect(fill = "white")) +
+  biggerfontfn() +
+  scale_x_discrete(labels = c("measured", bestmodel1name, bestmodel2name
+                              #,
+                              #"stock"
+                              )) +
+  labs(y = bquote('Energy Density (kJ g'^-1~'dry)'),
+       x = "")
+
+# save figure
+ggsave(here::here(str_c(OutputFolder, "/modelsBoxplot.png")),
+      width =  6, height = 8)
+
+```
+
+Figure 2. Model estimated energy densities are comparable to measured energy densities. The box plots display the median (horizontal line within box), first and third quartiles (box top and bottom), range (vertical lines) and outliers (circles) of measured or estimated energy density from example stocks. Energy density is in kJ g-1 dry weight. Models are defined in Table 1.
+
+### Smoothed Effects
+
+```{r effects}
+
+# use gratia to visualize effects
+visual_bestmodel1 <- draw(bestmodel1)
+
+ggsave(here::here(str_c(OutputFolder,
+                        "/visual_bestmodel1.png")),
+       visual_bestmodel1)
+
+```
+
+Figure 3. Smoothed effects of percent dry weight (PDRY) and fork length (FORK) within the GAM called pdry_fl (Table 1). Energy density increased as percent dry weight increases, except at the upper limit of the model. Energy density increased as fork length increased, until approximately 220 mm, when the energy density decreased.
+  
+### Seasonal Violin Plot
+
+```{r violin, warning=FALSE}
+
+# select abundance stocks from gsi data
+dry_gsi_mod %>%
+  filter(STOCK %in% abundantED) %>%
+  mutate(displayOrder = case_when(
+    MONTH == 5 ~ 5,
+    MONTH == 6 ~ 6,
+    MONTH == 7 ~ 7,
+    MONTH == 8 ~ 8,
+    MONTH == 9 ~ 9,
+    MONTH == 10 ~ 10,
+    MONTH == 11 ~ 11,
+    MONTH == 12 ~ 12,
+    MONTH == 1 ~ 13,
+    MONTH == 2 ~ 14,
+    MONTH == 3 ~ 15)) %>%
+  left_join(., nAbundant, by = "STOCK") %>%
+  
+  # omit least abundant stock to fit better on page
+  filter(n > 65) %>%
+  select(displayOrder, ED_1, nlabel) %>%
+
+  # violin plot
+  ggplot(aes(factor(displayOrder), ED_1)) +
+  geom_violin()+
+  stat_summary(fun = mean, geom = "point", size = 2, color = "black") +
+  labs(x = "Month",
+       y =   bquote('Energy Density (kJ g'^-1~'dry)')) +
+  facet_wrap(~nlabel, ncol = 2, drop = FALSE) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 90),
+        strip.background = element_rect(fill = "white")) +
+  biggerfontfn() + 
+  scale_x_discrete(labels = c("May", "Jun", "Jul", "Aug", "Oct", "Nov","Feb", "Mar"))
+
+# save plot
+ggsave(here::here(OutputFolder, "violin_month_bestmodel1.png"),
+       width = 7, height = 9)
+
+```
+
+Figure 4. Estimated energy densities became more variable and increased from summer to fall. Violin plots of the distribution of estimated energy density for eight stocks, calculated from percent dry weight and fork length (Table 2, pdry_fl model). The mean energy density is marked as a circle in each seasonal plot. Sample sizes per stock are indicated within the subtitles. 
+
+### Critical Size Hypothesis
+
+```{r harrison}
+
+# percentage of overwinter samples
+overwinter <- dry_gsi_mod %>%
+  filter(MONTH %in% c(1:3)) %>%
+  group_by(STOCK) %>%
+  summarise(numFish = length(FISH_NUMBER),
+            perFish = round((numFish/nrow(filter(dry_gsi_mod, MONTH %in% c(1:3))))*100)) %>%
+  arrange(-perFish)
+
+# what percentage of overwinter are Harrison?
+harrsionPercent <- overwinter %>%
+  filter(STOCK == "Harrison") %>%
+  pull(perFish)
+harrsionPercent
+
+# use Harrison only as majority of over winter samples 
+criticalDF <- dry_gsi_mod %>%
+  filter(STOCK == "Harrison") %>%
+  select(FISH_NUMBER, FORK, SEASON, MONTH, ED_1) %>%
+  # remove one caught in summer 
+  filter(SEASON != "Summer") %>%
+  mutate(MonthFac = case_when(
+    MONTH == 10 | MONTH == 11 ~ "Oct/Nov",
+    MONTH == 2 | MONTH == 3 ~ "Feb/Mar"
+  )) 
+
+# relevel
+criticalDF$MonthFac <- factor(criticalDF$MonthFac, 
+                              levels = c("Oct/Nov", "Feb/Mar"))
+
+# summarize values
+criticalDfsum <- criticalDF %>%
+  group_by(MonthFac) %>%
+  summarise(nFORK = length(FORK),
+            meanFORK = round(mean(FORK), 1),
+            minFORK = round(min(FORK), 1),
+            maxFORK = round(max(FORK), 1),
+            varFORK = round(var(FORK),1),
+            sdFORK = round(sd(FORK),1),
+            nED = length(ED_1),
+            meanED = round(mean(ED_1),1),
+            minED = round(min(ED_1),1),
+            maxED = round(max(ED_1),1),
+            varED = round(var(ED_1),1))
+criticalDfsum
+
+# length frequency
+lengthFreq <- ggplot(criticalDF) +
+  geom_bar(aes(FORK, fill = MonthFac)) +
+  scale_fill_manual(values = c("black", "gray50")) +
+  scale_x_continuous(breaks = c(seq(100, 260, by = 25))) +
+  labs(y = "Frequency",
+       x = "Fork Length (mm)",
+       fill = "Months") +
+  biggerfontfn()
+
+edFreq <- ggplot(criticalDF,
+                 aes(MonthFac, ED_1)) +
+  geom_violin() +
+  stat_summary(fun = mean, geom = "point", size = 2, color = "black") +
+  labs(x = "Months",
+       y = bquote('Energy Density (kJ g'^-1~'dry)')
+       ) +
+  biggerfontfn()
+
+harrisonlm <- ggplot(criticalDF, aes(FORK, ED_1)) +
+    geom_point(aes(
+      color = MonthFac,
+      shape = MonthFac)) +
+  labs(x = "Fork Length (mm)",
+       y = bquote('Energy Density (kJ g'^-1~'dry)'),
+       color = "Months",
+       shape = "Months") +
+  geom_smooth(method = "lm", formula = 'y~x', se = FALSE, color = "black") +
+  scale_color_manual(values = c("black", "gray50")) +
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+  scale_y_continuous(breaks = c(seq(20, 22.4, by = 0.5))) +  scale_x_continuous(breaks = c(seq(100, 260, by = 25))) +
+  biggerfontfn()
+
+# ED vs FL residuals by model
+mod <- lm(FORK ~ ED_1, data = criticalDF)
+
+Harrisonboxplot <- criticalDF %>%
+  modelr::add_residuals(mod) %>%
+
+  ggplot(aes(MonthFac, resid, group = MonthFac)) +
+    geom_boxplot() +
+      labs(x = "Months",
+       y = "Residuals") +
+  biggerfontfn()
+
+# arrange plots using patchwork
+harrisonGraphs <- lengthFreq + edFreq +
+  harrisonlm + Harrisonboxplot +
+  plot_annotation(tag_levels = 'A')
+harrisonGraphs
+
+# save as png for word document
+ggsave(here::here(OutputFolder, "/harrisonGraphs.png"),
+       plot = harrisonGraphs,
+       width =  8, height = 6,
+       dpi = 600)
+
+```
+
+
+Figure 5. Harrison juvenile sockeye salmon overwinter in coastal marine environments. (A) Fork length (mm) plotted by frequency in October/November and February/March showed an increase of mean fork length without a decrease in variance that would indicate size-selective mortality. (B) Model estimated energy density in October/November and February/March showed an increase overwinter. (C) There is a positive linear relationship between fork length and energy density overwinter. (D) Residuals from the linear relationship show variance of energy densities increased with fork length over winter.
+
+### Pink Competition
+
+```{r pink}
+
+# high sea regions for stocks in Salish Sea
+salish <- c("FRASER", "ECVI")
+
+# odd years are dominant for returning Fraser adults in southern BC
+# even years have abundant juvenile pinks in southern BC
+pkdom <- c(seq(from = 1998, to = 2012, by = 2))
+
+# wrangle data
+pkdata <- dry_gsi_mod %>%
+  mutate(salish = if_else(toupper(HS_REGION) %in% salish, "Y", "N"),
+         pkDom = if_else(YEAR %in% pkdom, "Abundant", "Few")) %>%
+  filter(salish == "Y")
+
+# is there a difference?
+pkstats_pd <- as_tibble(rcompanion::groupwiseMean(ED_1 ~ pkDom, data = pkdata, conf = 0.95, digits = 3))
+pkstats_pd
+
+# boxplot
+pkbox_bestmodel1 <- ggplot(pkdata,
+                           aes(pkDom, ED_1)) +
+  geom_boxplot() +
+  labs(x = "Pink Salmon Year",
+       y = bquote('Energy Density (kJ g'^-1~'dry)')) +
+    stat_summary(fun = mean, geom = "point", size = 3, shape = 8)
+  
+pkbox_bestmodel1
+
+# save plot
+ggsave(here::here(OutputFolder, "/pinkEDmeans_bestmodel1.png"),
+       width = 3, height = 3)
+
+```
+
+Figure 6. Comparable estimated energy density of Fraser River and East Coast Vancouver Island juvenile sockeye salmon stocks between years with abundant (even) juvenile pink salmon and few (odd) juvenile pink salmon, calculated using the GAM called pdry_fl (Table 1). The box plots display the median (horizontal line within box), first and third quartiles (box top and bottom), range (vertical lines), outliers (circle) and mean (stars) of estimated energy density from abundant and few pink salmon years.
+
+## Appendix
+
+### Summer Energy Density
+
+Appendix Table 1. Summer estimated energy density mean, number of samples (n), minimum (min), maximum (max), standard error (se) and standard deviation (sd) for juvenile sockeye salmon stocks calculated from the GAM called pdry_fl (Table 1). Only stocks with 5 or more individuals are included, and stocks are listed alphabetically.
+
+```{r summer}
+
+# select summer and > 5 samples only
+stockED_bestmodel1_summer_simp <- stockED_bestmodel1_summer %>%
+  filter(n > 4) %>%
+  select(-HS_REGION) %>%
+  arrange(Stock) %>%
+  rename(Region = ORIGIN)
+
+# display table
+kable(stockED_bestmodel1_summer_simp) %>%
+     kable_styling()
+
+# write as csv
+write_csv(stockED_bestmodel1_summer_simp, here::here(OutputFolder, "/ED_summer_simp.csv"),
+          na = "")
+
+```
+
+
+### Fall Energy Density
+
+Appendix Table 2. Fall estimated energy density mean, number of samples (n), minimum (min), maximum (max), standard error (se) and standard deviation (sd) for juvenile sockeye salmon stocks calculated from the GAM called pdry_fl (Table 1). Only stocks with 5 or more individuals are included, and stocks are listed alphabetically.
+
+```{r fall}
+
+# fall and at least 5 samples
+stockED_bestmodel1_fall_simp <- stockED_bestmodel1_fall %>%
+  filter(n > 4) %>%
+  select(-HS_REGION) %>%
+  # fix truncated stocks
+  mutate(Stock = case_when(
+    Stock == "Middleshuswap" ~ "Middle Shuswap",
+    Stock == "Quesnel Horsef" ~ "Quesnel Horsefly",
+    Stock == "Quesnel Mitche" ~ "Quesnel Mitchell",
+    TRUE ~ Stock
+  )) %>%
+  arrange(Stock) %>%
+  rename(Region = ORIGIN)
+
+# display table
+kable(stockED_bestmodel1_fall_simp) %>%
+     kable_styling()
+
+
+# write as csv
+write_csv(stockED_bestmodel1_fall_simp, here::here(OutputFolder, "/ED_fall_simp.csv"),
+          na = "")
+
+```
+
+## Supplemental Information
+
+RMarkdown file (SockeyeEnergyDensity_GAM.Rmd) is available on Github for R code underlying the models, tables and figures. 
+
+```{r supplemental}
+
+# modelled calorimetry data
+supp_data <- dry_gsi_mod %>%
+  select(CRUISE, DATE, MONTH, LAT, LONG, FISH_NUMBER, PDRY, FORK, ED, STOCK, ORIGIN, bestmodel1, gam_stk, ED_1) %>%
+  # change list to numeric for model columns
+  mutate(bestmodel1 = as.numeric(bestmodel1),
+         gam_stk = as.numeric(gam_stk),
+         ED_1 = as.numeric(ED_1)) %>%
+  rename(FinalED = ED_1) %>%
+  arrange(DATE, FISH_NUMBER)
+  
+# save data as csv file
+write_csv(supp_data, here::here(OutputFolder, "/supp_data.csv"), na = "")
+
+```
+
+### Surveys
+
+Supplementary Table 1. Survey details for juvenile sockeye salmon collections from 1998 to 2020. Tows are the number of tows per survey. GSI refers to genetic stock identification of juvenile sockeye samples that have been identified to stock with a probability of > 0.5, with fork length and percent dry weight values. ED are the number of samples with measured energy density using a calorimeter, and used in the training dataset for the model. No dry weights were completed from 2013-2017 surveys.
+
+```{r samples}
+kable(cruisesTable) %>%
+  kable_styling()
+
+```
+
+### Scatterplot
+
+```{r scatterplot}
+
+cal_all_month <- cal_all %>%
+  mutate(MONTH = case_when(
+           MONTH == "2" ~ 2,
+           MONTH == "6" ~ 6,
+           MONTH == "7" ~ 7,
+           MONTH == "10" ~ 10,
+           MONTH == "11" ~ 11))
+
+# look at scatter plot matrix to explore which covariates to investigate
+# save manually within RStudio to adjust dpi
+car::scatterplotMatrix(~ED +PDRY + FORK + WGT + MONTH, cal_all_month, 
+                       smooth = TRUE, 
+                       regLine = FALSE,
+                       col = "black")
+
+```
+Supplementary Figure 1. Relationships between measured energy density (ED, kJ g-1 dry weight), percent dry weight (PDRY), fork length in mm (FORK), wet weight in grams (WGT), and month caught (MONTH). Scatter plot matrix includes 257 juvenile sockeye salmon.
+
+### Diagnostic
+
+```{r diagnostics}
+
+# best model diagnostics
+diagnostic_bestmodel1 <- appraise(bestmodel1, 
+                                  # B&W for journal
+                                  line_col = "black")
+ggsave(here::here(str_c(OutputFolder,
+                        "/diagnostic_bestmodel1.png")),
+       diagnostic_bestmodel1)
+
+diagnostic_bestmodel1
+
+```
+
+Supplementary Figure 2. Diagnostic plots for GAM called pdry_fl (Table 1), indicate normality assumption is reasonable, and there are no discernible residual trends. There are leverage points at the lower extreme of the model, so care must be taken at the lower limits of the model.

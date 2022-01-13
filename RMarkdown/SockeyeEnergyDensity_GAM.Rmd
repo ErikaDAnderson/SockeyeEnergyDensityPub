@@ -659,16 +659,6 @@ write_csv(Total_ED, here::here(OutputFolder, "/EDTotals.csv"),
           na = "")
 ```
 
-Comparison of the overall energy densities from measured and estimated juvenile sockeye salmon using three models defined in Table 2.
-
-```{r comparisonTable}
-
-# display table
-kable(Total_ED) %>%
-     kable_styling()
-
-```
-
 ### Birkenhead
 
 A highly variable stock in summer was Birkenhead, within the Lillooet-Harrison L conservation unit. From 2002-2009, this stock was moved to the summer run timing group and in 2012 the status was accessed as green status. In 2010, Birkenhead was moved back into the late run timing group and by 2017 was accessed as amber status (Grant et al 2011, Fisheries and Oceans Canada 2020).  It is plausible that the variability with Birkenhead juvenile sockeye salmon represents the variability associated with shifting run timing and decreasing condition. Find pre-2010 energy densities to compare to after 2010.
@@ -817,6 +807,7 @@ Figure 2. Model estimated energy densities are comparable to measured energy den
 
 # use gratia to visualize effects
 visual_bestmodel1 <- draw(bestmodel1)
+visual_bestmodel1
 
 ggsave(here::here(str_c(OutputFolder,
                         "/visual_bestmodel1.png")),
@@ -919,7 +910,6 @@ criticalDfsum <- criticalDF %>%
             minED = round(min(ED_1),1),
             maxED = round(max(ED_1),1),
             varED = round(var(ED_1),1))
-criticalDfsum
 
 # length frequency
 lengthFreq <- ggplot(criticalDF) +
